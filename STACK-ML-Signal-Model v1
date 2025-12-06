@@ -1,0 +1,97 @@
+# ==========================================
+#   UNIVERSAL ML MODEL FOR ANY TICKER
+#   Change only: ticker = "AAPL"
+# ==========================================
+
+!pip install yfinance xgboost scikit-learn --quiet
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+
+# >>> CHANGE TICKER HERE ONLY <<<
+ticker = "BTC-USD"          # e.g. "NVDA", "TSLA", "SPY", "BTC-USD"
+
+# 1) Download 2 years of data
+df = yf.download(ticker, period="2y", interval="1d", auto_adjust=True)
+df = df[["High", "Low", "Close", "Volume"]].dropna()
+
+close = df["Close"]
+high = df["High"]
+low = df["Low"]
+
+# 2) RSI (14)
+delta = close.diff()
+gain = delta.clip(lower=0)
+loss = -delta.clip(upper=0)
+avg_gain = gain.rolling(14).mean()
+avg_loss = loss.rolling(14).mean()
+rs = avg_gain / avg_loss
+df["rsi"] = 100 - (100 / (1 + rs))
+
+# 3) MACD (12,26,9)
+ema12 = close.ewm(span=12, adjust=False).mean()
+ema26 = close.ewm(span=26, adjust=False).mean()
+df["macd"] = ema12 - ema26
+df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+
+# 4) ATR (14)
+prev_close = close.shift(1)
+tr1 = high - low
+tr2 = (high - prev_close).abs()
+tr3 = (low - prev_close).abs()
+tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+df["atr"] = tr.rolling(14).mean()
+
+# 5) Volatility + Trend
+df["vol_20"] = close.pct_change().rolling(20).std()
+df["sma20"] = close.rolling(20).mean()
+df["sma50"] = close.rolling(50).mean()
+df["trend"] = df["sma20"] - df["sma50"]
+
+df = df.dropna()
+
+# 6) Target = tomorrow up/down?
+df["return_1d"] = close.pct_change().shift(-1)
+df["target"] = (df["return_1d"] > 0).astype(int)
+df = df.dropna()
+
+features = ["rsi", "macd", "macd_signal", "atr", "vol_20", "trend"]
+X = df[features]
+y = df["target"]
+
+# 7) Split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+
+# 8) Train model
+model = XGBoost = XGBClassifier(
+    n_estimators=200,
+    max_depth=4,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+)
+model.fit(X_train, y_train)
+
+# 9) Report
+print(f"\n=== MODEL PERFORMANCE FOR {ticker} ===")
+print(confusion_matrix(y_test, model.predict(X_test)))
+print(classification_report(y_test, model.predict(X_test)))
+
+# 10) Predict tomorrow
+latest = df.iloc[-1]
+latest_feats = latest[features].values.reshape(1, -1)
+pred = model.predict(latest_feats)[0]
+prob_up = model.predict_proba(latest_feats)[0, 1]
+
+signal = "BUY" if pred == 1 else "SELL"
+
+print(f"\n=== {ticker} TOMORROW SIGNAL ===")
+print("Signal:", signal)
+print("Probability UP:", round(prob_up, 3))
+print("Based on latest date:", df.index[-1])
