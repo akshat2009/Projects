@@ -1,0 +1,196 @@
+# ============================================
+#   FULL QUANT MODEL (BUY / HOLD / SELL)
+#   Fundamentals + Technicals + Risk + ML
+# ============================================
+
+!pip install yfinance xgboost --quiet
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from xgboost import XGBRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+
+# --------------------------------------------
+# Utility
+# --------------------------------------------
+def sharpe_ratio(r):
+    if len(r) < 2: return 0
+    std = r.std()
+    if std == 0: return 0
+    return (r.mean() / std) * np.sqrt(252)
+
+def sortino_ratio(r):
+    neg = r[r < 0]
+    if len(neg) == 0: return 0
+    return (r.mean() / neg.std()) * np.sqrt(252)
+
+# --------------------------------------------
+# Feature engineering
+# --------------------------------------------
+def build_features(df, info):
+
+    c = df["Close"]
+    h = df["High"]
+    l = df["Low"]
+
+    # returns
+    ret1 = c.pct_change()
+    ret5 = c.pct_change(5)
+    ret21 = c.pct_change(21)
+    ret63 = c.pct_change(63)
+
+    # EMA
+    ema20 = c.ewm(span=20).mean()
+    ema50 = c.ewm(span=50).mean()
+    ema200 = c.ewm(span=200).mean()
+
+    # MACD
+    fast = c.ewm(span=12).mean()
+    slow = c.ewm(span=26).mean()
+    macd_line = fast - slow
+    macd_signal = macd_line.ewm(span=9).mean()
+    macd_hist = macd_line - macd_signal
+
+    # RSI
+    diff = c.diff()
+    up = diff.clip(lower=0)
+    dn = -diff.clip(upper=0)
+    rs = up.rolling(14).mean() / (dn.rolling(14).mean() + 1e-9)
+    rsi = 100 - (100 / (1 + rs))
+
+    # Williams %R
+    hh = h.rolling(14).max()
+    ll = l.rolling(14).min()
+    wr = -100 * (hh - c) / (hh - ll + 1e-9)
+
+    # Bollinger
+    mid = c.rolling(20).mean()
+    sd = c.rolling(20).std()
+    bb_pos = (c - mid) / (2 * sd + 1e-9)
+
+    # Volatility
+    vol21 = ret1.rolling(21).std() * np.sqrt(252)
+
+    # Sharpe / Sortino (recent)
+    sharpe = ret1.rolling(63).apply(sharpe_ratio, raw=False)
+    sortino = ret1.rolling(63).apply(sortino_ratio, raw=False)
+
+    # Fundamentals
+    pe = info.get("trailingPE", np.nan)
+    roe = info.get("returnOnEquity", np.nan)
+
+    feats = pd.DataFrame({
+        "ret1": ret1,
+        "ret5": ret5,
+        "ret21": ret21,
+        "ret63": ret63,
+        "ema20_dist": (c - ema20) / ema20,
+        "ema50_dist": (c - ema50) / ema50,
+        "ema200_dist": (c - ema200) / ema200,
+        "macd_line": macd_line,
+        "macd_signal": macd_signal,
+        "macd_hist": macd_hist,
+        "rsi": rsi,
+        "wr": wr,
+        "boll_pos": bb_pos,
+        "vol21": vol21,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "pe": pe,
+        "roe": roe,
+    })
+
+    return feats.dropna()
+
+# --------------------------------------------
+# ML price prediction model
+# --------------------------------------------
+def train_model(feats, future_returns):
+    X = feats.values
+    y = future_returns.values
+
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+
+    X_train, X_test, y_train, y_test = train_test_split(Xs, y, test_size=0.25, shuffle=False)
+
+    model = XGBRegressor(
+        n_estimators=300,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8
+    )
+
+    model.fit(X_train, y_train)
+
+    return model, scaler
+
+# --------------------------------------------
+# Score model (weights auto-learned from ML)
+# --------------------------------------------
+def weighted_score(latest_feats, model, scaler):
+    X = scaler.transform(latest_feats.values.reshape(1, -1))
+    pred = float(model.predict(X))
+
+    # convert to simple score 0–1
+    score = 0.5 + pred * 3
+    score = max(0, min(1, score))
+
+    if score > 0.65:
+        verdict = "BUY"
+    elif score > 0.45:
+        verdict = "HOLD"
+    else:
+        verdict = "SELL"
+
+    return score, verdict, pred
+
+# --------------------------------------------
+# Main function
+# --------------------------------------------
+def analyze_ticker(ticker):
+
+    tk = yf.Ticker(ticker)
+    info = tk.get_info()
+
+    df = tk.history(period="5y", interval="1d")
+    df = df[["Open","High","Low","Close","Volume"]]
+
+    feats = build_features(df, info)
+
+    # future 21-day return target
+    future_r = df["Close"].pct_change(21).shift(-21)
+    future_r = future_r.loc[feats.index]
+
+    model, scaler = train_model(feats, future_r)
+
+    latest = feats.iloc[-1]
+    score, verdict, pred_return = weighted_score(latest, model, scaler)
+
+    current_price = df["Close"].iloc[-1]
+    target_price = current_price * (1 + pred_return)
+
+    print("\n==============================")
+    print(f"TICKER: {ticker}")
+    print(f"Verdict: {verdict}")
+    print(f"Score: {round(score, 3)}")
+    print(f"Expected 21-day return: {round(pred_return*100, 2)}%")
+    print(f"Price now: {round(current_price, 2)}")
+    print(f"Target price: {round(target_price, 2)}")
+    print("==============================")
+
+    return {
+        "verdict": verdict,
+        "score": score,
+        "pred_return": pred_return,
+        "price_now": current_price,
+        "target_price": target_price
+    }
+
+# --------------------------------------------
+# RUN (change ticker here)
+# --------------------------------------------
+result = analyze_ticker("NVDA")   # ← change this to any ticker
