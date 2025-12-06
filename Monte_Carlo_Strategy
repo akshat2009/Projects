@@ -1,0 +1,145 @@
+# ======================================================================
+#   BULLETPROOF QUANT STRATEGY + MONTE CARLO (COLAB SAFE)
+# ======================================================================
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from scipy.stats import t as student_t
+
+# --------------------------
+# Utility (bulletproof 1D handling)
+# --------------------------
+def to_1d(x):
+    """Force any Series/DataFrame into a flat 1D numpy array."""
+    if isinstance(x, pd.DataFrame):
+        x = x.squeeze()
+    if isinstance(x, pd.Series):
+        return x.values.astype(float).flatten()
+    return np.asarray(x, dtype=float).flatten()
+
+def sharpe_ratio(returns):
+    r = to_1d(returns)
+    if len(r) < 2: return 0.0
+    std = np.std(r)
+    if float(std) == 0: return 0.0
+    return (np.mean(r) / std) * np.sqrt(252)
+
+def max_drawdown(equity):
+    eq = to_1d(equity)
+    peak = np.maximum.accumulate(eq)
+    dd = (eq - peak) / peak
+    return float(dd.min())
+
+def CAGR(equity):
+    eq = to_1d(equity)
+    years = len(eq)/252
+    if years <= 0: return 0
+    return eq[-1]**(1/years) - 1
+
+# --------------------------
+# Indicators
+# --------------------------
+def ema(s,n): return s.ewm(span=n, adjust=False).mean()
+def rsi(s, n=14):
+    diff = s.diff()
+    up = diff.clip(lower=0)
+    dn = -diff.clip(upper=0)
+    rs = up.rolling(n).mean() / (dn.rolling(n).mean() + 1e-9)
+    return 100 - (100/(1+rs))
+
+def macd_hist(s):
+    fast = ema(s,12)
+    slow = ema(s,26)
+    line = fast - slow
+    sig = line.ewm(span=9, adjust=False).mean()
+    return line - sig
+
+# --------------------------
+# QUANT STRATEGY
+# --------------------------
+def compute_signal(df):
+    c = df["Close"]
+
+    mom = c / c.shift(252) - 1
+    trend = ema(c,50) - ema(c,200)
+    mhist = macd_hist(c)
+    r = rsi(c)
+    vol = c.pct_change().rolling(30).std()
+
+    def nz(x):
+        return (x - x.mean()) / (x.std() + 1e-9)
+
+    composite = (
+        0.30*nz(mom) +
+        0.25*nz(trend) +
+        0.20*nz(mhist) +
+        0.15*nz(-abs(r - 55)) +
+        0.10*nz(-vol)
+    )
+
+    regime = (c > ema(c,200)).astype(float)
+    pos = composite.rank(pct=True) * regime
+    return pos.fillna(0)
+
+# --------------------------
+# BACKTEST
+# --------------------------
+def backtest(df):
+    pos = compute_signal(df)
+    rets = df["Close"].pct_change().fillna(0)
+    strat = pos * rets
+    equity = (1 + strat).cumprod()
+
+    return to_1d(equity), strat  # equity 1D, strat Series
+
+# --------------------------
+# MONTE CARLO
+# --------------------------
+def monte_carlo(returns, n_sims=1000):
+    r = to_1d(returns)
+    mu = np.mean(r)
+    sigma = np.std(r)
+    n = len(r)
+
+    sims = np.zeros((n_sims, n))
+    for i in range(n_sims):
+        noise = student_t.rvs(df=5, size=n) * sigma + mu
+        sims[i] = np.cumprod(1 + noise)
+
+    return sims
+
+# --------------------------
+# RUN
+# --------------------------
+ticker = "SPY"
+df = yf.download(ticker, period="5y", interval="1d", progress=False).dropna()
+
+equity, rets = backtest(df)
+
+print("\n=== BASE STRATEGY ===")
+print("Sharpe:", round(sharpe_ratio(rets), 3))
+print("CAGR:", round(CAGR(equity)*100, 2), "%")
+print("Max DD:", round(max_drawdown(equity)*100, 2), "%")
+
+sims = monte_carlo(rets, 1000)
+final_vals = sims[:, -1]
+
+print("\n=== MONTE CARLO ===")
+print("5%:", round(np.percentile(final_vals, 5), 3))
+print("50%:", round(np.percentile(final_vals, 50), 3))
+print("95%:", round(np.percentile(final_vals, 95), 3))
+
+plt.figure(figsize=(10,5))
+plt.plot(equity, label="Base Strategy", linewidth=2)
+for i in range(20):
+    plt.plot(sims[i], color="gray", alpha=0.12)
+plt.title("Monte Carlo Simulation")
+plt.legend()
+plt.show()
+
+plt.figure(figsize=(8,5))
+plt.hist(final_vals, bins=50, alpha=0.7)
+plt.title("Final Portfolio Distribution")
+plt.show()
